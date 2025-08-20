@@ -7,6 +7,7 @@
 import os
 import time
 import csv
+import json
 import logging
 from pathlib import Path
 from datetime import datetime, timezone
@@ -34,6 +35,7 @@ USE_TESTNET = _raw_flag in ("true", "1", "yes")
 SYMBOL = os.getenv("SYMBOL", "SOLUSDT").strip().upper()
 BASE = os.getenv("BASE", "SOL").strip().upper()
 QUOTE = os.getenv("QUOTE", "USDT").strip().upper()
+MARKET = f"{BASE}/{QUOTE}"
 
 # Buy levels (USDT -> BASE)
 BUY_SPLITS = [0.40, 0.40, 0.20]  # 40% / 40% / 20%
@@ -50,16 +52,43 @@ TP3_FAILSAFE_LIMIT   = Decimal("191.5")
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "3"))
 FEE_BUFFER = Decimal(os.getenv("FEE_BUFFER", "0.0015"))  # 0.15% buffer
 
-LOG_DIR = os.getenv("LOG_DIR", "./logs")
-Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+# Directories
+LOG_DIR = Path(os.getenv("LOG_DIR", "./logs"))
+STATE_DIR = Path(os.getenv("STATE_DIR", str(LOG_DIR)))  # default to LOG_DIR
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-# --- Logging (console + file) ---
-logfile = str(Path(LOG_DIR) / "solbot.log")
+# Files
+logfile = str(LOG_DIR / "solbot.log")
+trades_csv_path = LOG_DIR / "trades.csv"
+last_trade_id_path = STATE_DIR / "last_trade_id.txt"
+
+# Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.FileHandler(logfile, mode="a"), logging.StreamHandler()]
 )
+
+def dt_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def log_json(payload: dict, level: int = logging.INFO):
+    """Emit a single JSON line to stdout/file handlers."""
+    try:
+        logging.log(level, json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
+    except Exception as e:
+        logging.error(f"json_log_failed: {e} payload={payload}")
+
+def log_trade_csv(side: str, price: Decimal, qty: Decimal, note: str, order_id: str = ""):
+    """Append CSV line for trades/placements/cancels to trades.csv."""
+    header = ["ts_iso","network","symbol","market","side","price","qty","quote_value","order_id","note"]
+    write_header = not trades_csv_path.exists()
+    with open(trades_csv_path, "a", newline="") as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(header)
+        w.writerow([dt_iso(), NETWORK, SYMBOL, MARKET, side.upper(), str(price), str(qty), str(price*qty), str(order_id), note])
 
 # Sanity checks
 if not API_KEY or not API_SECRET:
@@ -67,8 +96,7 @@ if not API_KEY or not API_SECRET:
 
 # Client: ONLY pass base_url on testnet; never pass None on mainnet
 if USE_TESTNET:
-    client = Binance(api_key=API_KEY, api_secret=API_SECRET,
-                     base_url="https://testnet.binance.vision")
+    client = Binance(api_key=API_KEY, api_secret=API_SECRET, base_url="https://testnet.binance.vision")
 else:
     client = Binance(api_key=API_KEY, api_secret=API_SECRET)
 
@@ -82,19 +110,8 @@ if SYMBOL not in SYMBOLS:
     raise SystemExit(f"Symbol {SYMBOL} not listed on this environment. Try BTCUSDT or ETHUSDT on testnet.")
 
 # =========================
-# UTILITIES
+# EXCHANGE FILTERS & ROUNDS
 # =========================
-
-def dt_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-def log_trade(side: str, price: Decimal, qty: Decimal, note: str, order_id: str = ""):
-    trades_csv = str(Path(LOG_DIR) / "trades.csv")
-    if not Path(trades_csv).exists():
-        with open(trades_csv, "w", newline="") as f:
-            csv.writer(f).writerow(["ts_iso","side","price","qty","quote_value","order_id","note"])
-    with open(trades_csv, "a", newline="") as f:
-        csv.writer(f).writerow([dt_iso(), side.upper(), str(price), str(qty), str(price*qty), str(order_id), note])
 
 def exchange_filters(symbol: str):
     info = client.exchange_info(symbol=symbol)
@@ -126,6 +143,10 @@ def round_qty(q: Decimal) -> Decimal:
 def notional_ok(price: Decimal, qty: Decimal) -> bool:
     return (price * qty) >= FILTERS["minNotional"]
 
+# =========================
+# EXCHANGE HELPERS
+# =========================
+
 def balances():
     acct = client.account()
     balmap = {b["asset"]: Decimal(b["free"]) for b in acct["balances"]}
@@ -156,6 +177,10 @@ def find_open_by_price(side: str, price: Decimal, tol_ticks: int = 0):
                 hits.append(od)
     return hits
 
+# =========================
+# ORDER ACTIONS (with JSON logs)
+# =========================
+
 def place_limit_maker(side: str, price: Decimal, qty: Decimal, tag: str = "") -> dict:
     """Post-only (LIMIT_MAKER) to seek maker fees where possible."""
     if qty <= 0:
@@ -174,11 +199,39 @@ def place_limit_maker(side: str, price: Decimal, qty: Decimal, tag: str = "") ->
     }
     try:
         od = client.new_order(**params)
-        logging.info(f"[{NETWORK}] Placed {side} LIMIT_MAKER {qty} @ {price} tag={tag} id={od.get('orderId')}")
-        log_trade(side, price, qty, f"placed {tag}", str(od.get("orderId","")))
+        msg = f"[{NETWORK}] Placed {side} LIMIT_MAKER {qty} @ {price} tag={tag} id={od.get('orderId')}"
+        logging.info(msg)
+        log_trade_csv(side, price, qty, f"placed {tag}", str(od.get("orderId","")))
+        log_json({
+            "ts": dt_iso(),
+            "event": "order_placed",
+            "network": NETWORK,
+            "symbol": SYMBOL,
+            "market": MARKET,
+            "side": side.lower(),
+            "type": "LIMIT_MAKER",
+            "price": str(price),
+            "qty": str(qty),
+            "order_id": str(od.get("orderId","")),
+            "client_order_id": od.get("clientOrderId",""),
+            "tag": tag
+        })
         return od
     except Exception as e:
         logging.error(f"[{NETWORK}] place_limit_maker failed: {e}")
+        log_json({
+            "ts": dt_iso(),
+            "event": "error",
+            "where": "place_limit_maker",
+            "network": NETWORK,
+            "symbol": SYMBOL,
+            "market": MARKET,
+            "side": side.lower(),
+            "price": str(price),
+            "qty": str(qty),
+            "error": str(e),
+            "tag": tag
+        }, level=logging.ERROR)
         return {}
 
 def place_limit(side: str, price: Decimal, qty: Decimal, tag: str = "") -> dict:
@@ -200,20 +253,67 @@ def place_limit(side: str, price: Decimal, qty: Decimal, tag: str = "") -> dict:
     }
     try:
         od = client.new_order(**params)
-        logging.info(f"[{NETWORK}] Placed {side} LIMIT {qty} @ {price} tag={tag} id={od.get('orderId')}")
-        log_trade(side, price, qty, f"placed {tag}", str(od.get("orderId","")))
+        msg = f"[{NETWORK}] Placed {side} LIMIT {qty} @ {price} tag={tag} id={od.get('orderId')}"
+        logging.info(msg)
+        log_trade_csv(side, price, qty, f"placed {tag}", str(od.get("orderId","")))
+        log_json({
+            "ts": dt_iso(),
+            "event": "order_placed",
+            "network": NETWORK,
+            "symbol": SYMBOL,
+            "market": MARKET,
+            "side": side.lower(),
+            "type": "LIMIT",
+            "price": str(price),
+            "qty": str(qty),
+            "order_id": str(od.get("orderId","")),
+            "client_order_id": od.get("clientOrderId",""),
+            "tag": tag
+        })
         return od
     except Exception as e:
         logging.error(f"[{NETWORK}] place_limit failed: {e}")
+        log_json({
+            "ts": dt_iso(),
+            "event": "error",
+            "where": "place_limit",
+            "network": NETWORK,
+            "symbol": SYMBOL,
+            "market": MARKET,
+            "side": side.lower(),
+            "price": str(price),
+            "qty": str(qty),
+            "error": str(e),
+            "tag": tag
+        }, level=logging.ERROR)
         return {}
 
 def cancel_order(order_id: int):
     try:
         res = client.cancel_order(symbol=SYMBOL, orderId=order_id)
         logging.info(f"[{NETWORK}] Canceled order {order_id}")
+        log_trade_csv("CANCEL", Decimal("0"), Decimal("0"), "canceled", str(order_id))
+        log_json({
+            "ts": dt_iso(),
+            "event": "order_canceled",
+            "network": NETWORK,
+            "symbol": SYMBOL,
+            "market": MARKET,
+            "order_id": str(order_id)
+        })
         return res
     except Exception as e:
         logging.error(f"[{NETWORK}] cancel_order failed: {e}")
+        log_json({
+            "ts": dt_iso(),
+            "event": "error",
+            "where": "cancel_order",
+            "network": NETWORK,
+            "symbol": SYMBOL,
+            "market": MARKET,
+            "order_id": str(order_id),
+            "error": str(e)
+        }, level=logging.ERROR)
         return {}
 
 # =========================
@@ -283,6 +383,84 @@ def ensure_sell_grid():
             place_limit("SELL", TP3_FAILSAFE_LIMIT, qty_tp3, "SELL_TP3_FS")
 
 # =========================
+# FILLS (myTrades polling)
+# =========================
+
+def _load_last_trade_id() -> int:
+    try:
+        if last_trade_id_path.exists():
+            return int(last_trade_id_path.read_text().strip())
+    except Exception:
+        pass
+    return -1
+
+def _save_last_trade_id(tid: int):
+    try:
+        last_trade_id_path.write_text(str(tid))
+    except Exception as e:
+        logging.error(f"save_last_trade_id failed: {e}")
+
+def scan_new_fills():
+    """
+    Poll recent trades for this symbol and emit JSON/CSV lines for new fills.
+    Uses 'id' increasing order. Stores last seen id in STATE_DIR/last_trade_id.txt.
+    """
+    last_seen = _load_last_trade_id()
+    try:
+        trades = client.my_trades(symbol=SYMBOL, limit=50)  # most recent first
+    except Exception as e:
+        logging.error(f"[{NETWORK}] my_trades failed: {e}")
+        log_json({
+            "ts": dt_iso(),
+            "event": "error",
+            "where": "my_trades",
+            "network": NETWORK,
+            "symbol": SYMBOL,
+            "market": MARKET,
+            "error": str(e)
+        }, level=logging.ERROR)
+        return
+
+    # sort ascending by id so we process old -> new
+    trades_sorted = sorted(trades, key=lambda t: int(t["id"]))
+    max_id = last_seen
+    for t in trades_sorted:
+        tid = int(t["id"])
+        if tid <= last_seen:
+            continue
+        # fields per Binance REST: price, qty, quoteQty, commission, commissionAsset, time, isBuyer, orderId
+        price = Decimal(t.get("price", "0"))
+        qty = Decimal(t.get("qty", "0"))
+        side = "buy" if t.get("isBuyer") else "sell"
+        order_id = str(t.get("orderId", ""))
+        ts_ms = int(t.get("time", 0))
+        ts_iso = datetime.fromtimestamp(ts_ms/1000, tz=timezone.utc).isoformat()
+
+        # CSV + JSON line for the fill
+        log_trade_csv(side.upper(), price, qty, "fill", order_id)
+        log_json({
+            "ts": ts_iso,
+            "event": "fill",
+            "network": NETWORK,
+            "symbol": SYMBOL,
+            "market": MARKET,
+            "side": side,
+            "price": str(price),
+            "qty": str(qty),
+            "quote_qty": t.get("quoteQty"),
+            "order_id": order_id,
+            "trade_id": str(tid),
+            "commission": t.get("commission"),
+            "commission_asset": t.get("commissionAsset"),
+            "is_maker": bool(t.get("isMaker")),
+        })
+        if tid > max_id:
+            max_id = tid
+
+    if max_id > last_seen:
+        _save_last_trade_id(max_id)
+
+# =========================
 # MAIN LOOP
 # =========================
 
@@ -294,26 +472,72 @@ def main():
         if float(b["free"]) + float(b["locked"]) > 0:
             logging.info(f"[{NETWORK}]   {b['asset']}: free={b['free']} locked={b['locked']}")
 
+    # Startup JSON heartbeat
+    log_json({
+        "ts": dt_iso(),
+        "event": "bot_start",
+        "network": NETWORK,
+        "symbol": SYMBOL,
+        "market": MARKET,
+        "env_loaded_from": str(env_loaded_from)
+    })
+
     logging.info(f"[{NETWORK}] Running… CTRL+C to stop")
 
     while True:
         try:
             price = get_price()
+
+            # Strategy
             ensure_buy_grid()
             ensure_sell_grid()
 
+            # Fills (actual executions)
+            scan_new_fills()
+
             base_free, quote_free = balances()
             open_cnt = len(open_orders())
+
+            # Text heartbeat
             logging.info(
                 f"[{NETWORK}] Price={price:.2f} | {BASE}={base_free:.4f} | {QUOTE}={quote_free:.2f} | open_orders={open_cnt}"
             )
+
+            # JSON heartbeat (lower frequency if needed)
+            log_json({
+                "ts": dt_iso(),
+                "event": "heartbeat",
+                "network": NETWORK,
+                "symbol": SYMBOL,
+                "market": MARKET,
+                "price": str(price),
+                "balances": {BASE: str(base_free), QUOTE: str(quote_free)},
+                "open_orders": open_cnt
+            })
+
             time.sleep(POLL_SECONDS)
 
         except KeyboardInterrupt:
             logging.info(f"[{NETWORK}] Stopping…")
+            log_json({
+                "ts": dt_iso(),
+                "event": "bot_stop",
+                "network": NETWORK,
+                "symbol": SYMBOL,
+                "market": MARKET
+            })
             break
         except Exception as e:
             logging.error(f"[{NETWORK}] main loop error: {e}")
+            log_json({
+                "ts": dt_iso(),
+                "event": "error",
+                "where": "main_loop",
+                "network": NETWORK,
+                "symbol": SYMBOL,
+                "market": MARKET,
+                "error": str(e)
+            }, level=logging.ERROR)
             time.sleep(max(5, POLL_SECONDS))
 
 if __name__ == "__main__":
