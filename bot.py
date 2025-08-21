@@ -32,9 +32,9 @@ QUOTE  = os.getenv("QUOTE", "USDT").strip().upper()
 MARKET = f"{BASE}/{QUOTE}"
 
 # Strategy
-BUY_LEVELS  = [Decimal("170"), Decimal("165"), Decimal("160")]
-BUY_SPLITS  = [Decimal("0.40"), Decimal("0.40"), Decimal("0.20")]
-SELL_LEVELS = [Decimal("180"), Decimal("190"), Decimal("200")]
+BUY_LEVELS  = [Decimal("175"), Decimal("165"), Decimal("160")]
+BUY_SPLITS  = [Decimal("0.30"), Decimal("0.50"), Decimal("0.20")]
+SELL_LEVELS = [Decimal("185"), Decimal("190"), Decimal("200")]
 SELL_SPLITS = [Decimal("0.40"), Decimal("0.40"), Decimal("0.20")]
 TP3_FAILSAFE_TRIGGER = Decimal("192")
 TP3_FAILSAFE_LIMIT   = Decimal("191.5")
@@ -62,35 +62,34 @@ logging.basicConfig(
 
 from twilio.rest import Client as TwilioClient
 
+
 def notify_whatsapp(text: str):
-    """
-    Sends a WhatsApp message using Twilio.
-    Tries API Key auth first (TWILIO_API_KEY_SID/SECRET), then falls back to Account SID/Auth Token.
-    """
     try:
         w_from = os.getenv("WHATSAPP_FROM")
         w_to   = os.getenv("WHATSAPP_TO")
         if not (w_from and w_to):
-            return  # not configured
+            return
 
-        # Prefer API Key auth if present
-        api_key_sid    = os.getenv("TWILIO_API_KEY_SID")
-        api_key_secret = os.getenv("TWILIO_API_KEY_SECRET")
+        api_sid    = os.getenv("TWILIO_API_KEY_SID")
+        api_secret = os.getenv("TWILIO_API_KEY_SECRET")
+        acct_sid   = os.getenv("TWILIO_ACCOUNT_SID")
+        auth_tok   = os.getenv("TWILIO_AUTH_TOKEN")
 
-        if api_key_sid and api_key_secret:
-            client = TwilioClient(api_key_sid, api_key_secret)
-        else:
-            # Fallback to classic Account SID + Auth Token
-            acct_sid = os.getenv("TWILIO_ACCOUNT_SID")
-            auth_tok = os.getenv("TWILIO_AUTH_TOKEN")
-            if not (acct_sid and auth_tok):
-                return  # no credentials available
+        # Prefer API Key auth if present (must include Account SID as 3rd arg)
+        if api_sid and api_secret and acct_sid:
+            client = TwilioClient(api_sid, api_secret, acct_sid)
+        elif acct_sid and auth_tok:
             client = TwilioClient(acct_sid, auth_tok)
+        else:
+            # Not configured correctly; skip quietly
+            return
 
         client.messages.create(from_=w_from, to=w_to, body=text[:1500])
     except Exception as e:
         logging.error(f"notify_whatsapp failed: {e}")
         log_json({"ts": dt_iso(), "event": "error", "where": "notify_whatsapp", "error": str(e)}, level=logging.ERROR)
+
+
 
 
 
@@ -459,6 +458,7 @@ def scan_new_fills_and_update_state(st: dict):
                 f"Order: {order_id}\n"
                 f"Trade: {tid}\n"
                 f"Net:   {NETWORK}"
+                
             )
             notify_whatsapp(msg)
         except Exception:
