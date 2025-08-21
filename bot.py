@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from dotenv import load_dotenv, find_dotenv
 from binance.spot import Spot as Binance
+from twilio.rest import Client as TwilioClient
 
 # =========================
 # ENV + CONSTANTS
@@ -58,6 +59,41 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.FileHandler(logfile, mode="a"), logging.StreamHandler()]
 )
+
+from twilio.rest import Client as TwilioClient
+
+def notify_whatsapp(text: str):
+    """
+    Sends a WhatsApp message using Twilio.
+    Tries API Key auth first (TWILIO_API_KEY_SID/SECRET), then falls back to Account SID/Auth Token.
+    """
+    try:
+        w_from = os.getenv("WHATSAPP_FROM")
+        w_to   = os.getenv("WHATSAPP_TO")
+        if not (w_from and w_to):
+            return  # not configured
+
+        # Prefer API Key auth if present
+        api_key_sid    = os.getenv("TWILIO_API_KEY_SID")
+        api_key_secret = os.getenv("TWILIO_API_KEY_SECRET")
+
+        if api_key_sid and api_key_secret:
+            client = TwilioClient(api_key_sid, api_key_secret)
+        else:
+            # Fallback to classic Account SID + Auth Token
+            acct_sid = os.getenv("TWILIO_ACCOUNT_SID")
+            auth_tok = os.getenv("TWILIO_AUTH_TOKEN")
+            if not (acct_sid and auth_tok):
+                return  # no credentials available
+            client = TwilioClient(acct_sid, auth_tok)
+
+        client.messages.create(from_=w_from, to=w_to, body=text[:1500])
+    except Exception as e:
+        logging.error(f"notify_whatsapp failed: {e}")
+        log_json({"ts": dt_iso(), "event": "error", "where": "notify_whatsapp", "error": str(e)}, level=logging.ERROR)
+
+
+
 
 def dt_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -296,7 +332,7 @@ def ensure_buy_grid(st: dict):
         if not st["armed"]["buys"][idx-1]:
             continue  # disarmed — wait for re-arm signal
         tag = f"BUY{idx}"
-        # Enforce one order per level: if any open at that exact level, skip
+        # Enforce one order per level: if any open at that exact level, skip this is to prevent duplicates / fees 
         if find_open_by_exact_price("BUY", level):
             continue
         # LIMIT_MAKER safety
@@ -335,7 +371,7 @@ def ensure_sell_grid(st: dict):
         qty = usable_sol * split * (Decimal("1") - FEE_BUFFER)
         place_limit_maker("SELL", level, qty, tag)
 
-    # TP3 (200) with fail-safe (191.5)
+    # TP3 (200) with fail-safe (191.5) in case price starts dropping back down before we reach 200 
     idx = 3
     if st["armed"]["sells"][idx-1]:
         tp3_exists = bool(find_open_by_exact_price("SELL", SELL_LEVELS[2]))
@@ -379,8 +415,10 @@ def scan_new_fills_and_update_state(st: dict):
         trades = client.my_trades(symbol=SYMBOL, limit=50)  # most recent first
     except Exception as e:
         logging.error(f"[{NETWORK}] my_trades failed: {e}")
-        log_json({"ts": dt_iso(), "event": "error", "where": "my_trades",
-                  "network": NETWORK, "symbol": SYMBOL, "market": MARKET, "error": str(e)}, level=logging.ERROR)
+        log_json({
+            "ts": dt_iso(), "event": "error", "where": "my_trades",
+            "network": NETWORK, "symbol": SYMBOL, "market": MARKET, "error": str(e)
+        }, level=logging.ERROR)
         return
 
     trades_sorted = sorted(trades, key=lambda t: int(t["id"]))
@@ -400,6 +438,7 @@ def scan_new_fills_and_update_state(st: dict):
         ts_ms = int(t.get("time", 0))
         ts_iso = datetime.fromtimestamp(ts_ms/1000, tz=timezone.utc).isoformat()
 
+        # CSV + JSON log for the fill
         log_trade_csv(side.upper(), price, qty, "fill", order_id)
         log_json({
             "ts": ts_iso, "event": "fill", "network": NETWORK, "symbol": SYMBOL, "market": MARKET,
@@ -408,6 +447,23 @@ def scan_new_fills_and_update_state(st: dict):
             "commission_asset": t.get("commissionAsset"), "is_maker": bool(t.get("isMaker"))
         })
 
+        # ✅ WhatsApp notify on each fill (now variables are defined)
+        try:
+            side_emoji = "🟢 BUY" if side == "buy" else "🔴 SELL"
+            msg = (
+                f"{side_emoji} {MARKET}\n"
+                f"Price: {price}\n"
+                f"Qty:   {qty}\n"
+                f"Quote: {t.get('quoteQty')}\n"
+                f"Maker: {bool(t.get('isMaker'))}\n"
+                f"Order: {order_id}\n"
+                f"Trade: {tid}\n"
+                f"Net:   {NETWORK}"
+            )
+            notify_whatsapp(msg)
+        except Exception:
+            pass
+
         # Map fill to a level and disarm that level
         if side == "buy":
             idx = _closest_level(price, BUY_LEVELS, max_ticks=1)
@@ -415,10 +471,9 @@ def scan_new_fills_and_update_state(st: dict):
                 st["armed"]["buys"][idx] = False
             buy_filled = True
         else:
-            # SELL side (TP3 can be at 200 or 191.5)
             idx = _closest_level(price, SELL_LEVELS, max_ticks=1)
             if idx == -1 and abs(round_price(price) - round_price(TP3_FAILSAFE_LIMIT)) <= FILTERS["tickSize"]:
-                idx = 2  # treat fail-safe as TP3 for arming purposes
+                idx = 2  # treat fail-safe as TP3
             if idx != -1 and st["armed"]["sells"][idx]:
                 st["armed"]["sells"][idx] = False
             sell_filled = True
@@ -426,9 +481,7 @@ def scan_new_fills_and_update_state(st: dict):
         if tid > max_id:
             max_id = tid
 
-    # Re-arm logic:
-    # - Any BUY fill -> re-arm all SELL legs (so you can realize profits later).
-    # - Any SELL fill -> re-arm all BUY legs (so you can reload later).
+    # Re-arm logic
     if buy_filled:
         st["armed"]["sells"] = [True, True, True]
         log_json({"ts": dt_iso(), "event": "rearm", "side": "sells", "reason": "buy_fill"})
@@ -439,6 +492,7 @@ def scan_new_fills_and_update_state(st: dict):
     if max_id > last_seen:
         st["last_trade_id"] = max_id
         _save_last_trade_id(max_id)
+
 
 # =========================
 # MAIN LOOP
@@ -461,11 +515,11 @@ def main():
 
     while True:
         try:
-            # Observe fills and update arming state
+            # Observe current fills and update arming state
             scan_new_fills_and_update_state(st)
             save_state(st)
 
-            # Maintain one order per armed level
+            # Make sure only one order gets placed per armed level so, 180, 190, 200 or 191.5 
             ensure_buy_grid(st)
             ensure_sell_grid(st)
 
@@ -492,7 +546,7 @@ def main():
         except Exception as e:
             logging.error(f"[{NETWORK}] main loop error: {e}")
             log_json({"ts": dt_iso(), "event": "error", "where": "main_loop",
-                      "network": NETWORK, "symbol": SYMBOL, "market": MARKET, "error": str(e)}, level=logging.ERROR)
+            "network": NETWORK, "symbol": SYMBOL, "market": MARKET, "error": str(e)}, level=logging.ERROR)
             time.sleep(max(5, POLL_SECONDS))
 
 if __name__ == "__main__":
