@@ -91,9 +91,6 @@ def notify_whatsapp(text: str):
 
 
 
-
-
-
 def dt_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -448,13 +445,13 @@ def scan_new_fills_and_update_state(st: dict):
 
         # ✅ WhatsApp notify on each fill (now variables are defined)
         try:
-            side_emoji = "🟢 BUY" if side == "buy" else "🔴 SELL"
+            side_emoji = "🪙 - Master TiG I Bought You some Solana - 🪙" if side == "buy" else "💰 - Master TiG I Sold Some Solana - 💰"
             msg = (
                 f"{side_emoji} {MARKET}\n"
                 f"Price: {price}\n"
                 f"Qty:   {qty}\n"
                 f"Quote: {t.get('quoteQty')}\n"
-                f"Maker: {bool(t.get('isMaker'))}\n"
+                f"Maker: {bool(t.get('isMarker'))}\n"
                 f"Order: {order_id}\n"
                 f"Trade: {tid}\n"
                 f"Net:   {NETWORK}"
