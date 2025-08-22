@@ -60,9 +60,9 @@ logging.basicConfig(
     handlers=[logging.FileHandler(logfile, mode="a"), logging.StreamHandler()]
 )
 
-from twilio.rest import Client as TwilioClient
-
-
+# =========================
+# NOTIFY
+# =========================
 def notify_whatsapp(text: str):
     try:
         w_from = os.getenv("WHATSAPP_FROM")
@@ -89,8 +89,9 @@ def notify_whatsapp(text: str):
         logging.error(f"notify_whatsapp failed: {e}")
         log_json({"ts": dt_iso(), "event": "error", "where": "notify_whatsapp", "error": str(e)}, level=logging.ERROR)
 
-
-
+# =========================
+# UTILS
+# =========================
 def dt_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -108,6 +109,53 @@ def log_trade_csv(side, price, qty, note, order_id=""):
         if write_header:
             w.writerow(header)
         w.writerow([dt_iso(), NETWORK, SYMBOL, MARKET, side.upper(), str(price), str(qty), str(price*qty), str(order_id), note])
+
+# ===== Notification formatting helpers =====
+def fmt_qty(x: Decimal, places=6) -> str:
+    q = x.quantize(Decimal(10) ** -places)
+    s = f"{q.normalize():f}"
+    return s
+
+def fmt_usd(x: Decimal) -> str:
+    # 2–3 decimals depending on magnitude
+    places = 2 if x.copy_abs() >= Decimal("1") else 3
+    return f"{x.quantize(Decimal(10) ** -places):f}"
+
+def build_fill_message(
+    side: str,
+    price: Decimal,
+    qty: Decimal,
+    quote_qty: Decimal,
+    order_id: str,
+    trade_id: str,
+    network: str,
+) -> str:
+    # Pull current totals after the fill
+    base_free, quote_free = balances()
+    open_cnt = len(open_orders())
+
+    side_up = side.upper()
+    is_buy = (side_up == "BUY")
+    icon = "🪙 BUY 🪙" if is_buy else "💰 SELL 💰"
+    action_line = f"{icon} FILLED — {MARKET}"
+    px_line = f"Price: {fmt_usd(price)} {QUOTE}"
+    qty_line = f"Qty:   {fmt_qty(qty)} {BASE}"
+
+    spent_line = f"Spent: {fmt_usd(quote_qty)} {QUOTE}" if is_buy else f"Received: {fmt_usd(quote_qty)} {QUOTE}"
+
+    totals = (
+        "Totals now:\n"
+        f"• {BASE}:  {fmt_qty(base_free)}\n"
+        f"• {QUOTE}: {fmt_usd(quote_free)}"
+    )
+
+    meta = (
+        f"Open orders: {open_cnt}\n"
+        f"Order: {order_id} | Trade: {trade_id}\n"
+        f"Net: {network} | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
+    )
+
+    return "\n".join([action_line, px_line, qty_line, spent_line, "", totals, "", meta])
 
 # =========================
 # CLIENT + EXCHANGE INFO
@@ -328,7 +376,7 @@ def ensure_buy_grid(st: dict):
         if not st["armed"]["buys"][idx-1]:
             continue  # disarmed — wait for re-arm signal
         tag = f"BUY{idx}"
-        # Enforce one order per level: if any open at that exact level, skip this is to prevent duplicates / fees 
+        # Enforce one order per level
         if find_open_by_exact_price("BUY", level):
             continue
         # LIMIT_MAKER safety
@@ -367,7 +415,7 @@ def ensure_sell_grid(st: dict):
         qty = usable_sol * split * (Decimal("1") - FEE_BUFFER)
         place_limit_maker("SELL", level, qty, tag)
 
-    # TP3 (200) with fail-safe (191.5) in case price starts dropping back down before we reach 200 
+    # TP3 (200) with fail-safe (191.5)
     idx = 3
     if st["armed"]["sells"][idx-1]:
         tp3_exists = bool(find_open_by_exact_price("SELL", SELL_LEVELS[2]))
@@ -443,23 +491,21 @@ def scan_new_fills_and_update_state(st: dict):
             "commission_asset": t.get("commissionAsset"), "is_maker": bool(t.get("isMaker"))
         })
 
-        # ✅ WhatsApp notify on each fill (now variables are defined)
+        # ✅ WhatsApp notify on each fill — concise, totals-first layout
         try:
-            side_emoji = "🪙 - Master TiG I Bought You some Solana - 🪙" if side == "buy" else "💰 - Master TiG I Sold Some Solana - 💰"
-            msg = (
-                f"{side_emoji} {MARKET}\n"
-                f"Price: {price}\n"
-                f"Qty:   {qty}\n"
-                f"Quote: {t.get('quoteQty')}\n"
-                f"Maker: {bool(t.get('isMarker'))}\n"
-                f"Order: {order_id}\n"
-                f"Trade: {tid}\n"
-                f"Net:   {NETWORK}"
-                
+            quote_qty = Decimal(t.get("quoteQty", "0"))
+            msg = build_fill_message(
+                side=side.upper(),
+                price=price,
+                qty=qty,
+                quote_qty=quote_qty,
+                order_id=order_id,
+                trade_id=str(tid),
+                network=NETWORK,
             )
             notify_whatsapp(msg)
-        except Exception:
-            pass
+        except Exception as _e:
+            logging.error(f"notify build failed: {_e}")
 
         # Map fill to a level and disarm that level
         if side == "buy":
@@ -478,7 +524,22 @@ def scan_new_fills_and_update_state(st: dict):
         if tid > max_id:
             max_id = tid
 
-    # Re-arm logic
+        # Also log a summary we can actually fucking read
+        try:
+            log_json({
+                "ts": ts_iso, "event": "fill_summary",
+                "summary": build_fill_message(
+                    side=side.upper(),
+                    price=price, qty=qty,
+                    quote_qty=Decimal(t.get("quoteQty", "0")),
+                    order_id=order_id, trade_id=str(tid),
+                    network=NETWORK
+                )
+            })
+        except Exception:
+            pass
+
+    # Re-arm logic for next trades after state has cleared our main targets 
     if buy_filled:
         st["armed"]["sells"] = [True, True, True]
         log_json({"ts": dt_iso(), "event": "rearm", "side": "sells", "reason": "buy_fill"})
@@ -489,7 +550,6 @@ def scan_new_fills_and_update_state(st: dict):
     if max_id > last_seen:
         st["last_trade_id"] = max_id
         _save_last_trade_id(max_id)
-
 
 # =========================
 # MAIN LOOP
@@ -516,11 +576,11 @@ def main():
             scan_new_fills_and_update_state(st)
             save_state(st)
 
-            # Make sure only one order gets placed per armed level so, 180, 190, 200 or 191.5 
+            # Make sure only one order gets placed per armed level
             ensure_buy_grid(st)
             ensure_sell_grid(st)
 
-            # Heartbeat 
+            # Heartbeat
             price = get_price()
             base_free, quote_free = balances()
             open_cnt = len(open_orders())
